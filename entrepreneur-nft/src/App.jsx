@@ -29,9 +29,14 @@ function App() {
   const [acceptedTerms, setAcceptedTerms] = useState(false);
   const [balances, setBalances] = useState({});
   const [nftData, setNftData] = useState(null);
+  const [destinations, setDestinations] = useState({ axmcSafe: '', treasury: '' });
 
   useEffect(() => {
     if (wallet) fetchBalances();
+  }, [wallet]);
+
+  useEffect(() => {
+    loadContractDestinations();
   }, [wallet]);
 
   async function connectWallet() {
@@ -55,12 +60,52 @@ function App() {
     setBalances(newBalances);
   }
 
+  async function loadContractDestinations() {
+    if (!window.ethereum) return;
+    try {
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, abi, provider);
+      const [axmcSafe, treasury] = await Promise.all([
+        contract.axmcSafe(),
+        contract.treasury(),
+      ]);
+      setDestinations({ axmcSafe, treasury });
+    } catch (err) {
+      console.error('❌ Failed to load payout destinations:', err);
+    }
+  }
+
+  async function loadMemberPass(contract, address) {
+    const balance = await contract.balanceOf(address);
+    if (balance > 0n) {
+      for (let i = 1; i <= 200; i++) {
+        try {
+          const owner = await contract.ownerOf(i);
+          if (owner.toLowerCase() === address.toLowerCase()) {
+            const tokenUri = await contract.tokenURI(i);
+            const metadata = await fetch(tokenUri).then(res => res.json());
+            return { id: String(i), ...metadata };
+          }
+        } catch (_) {}
+      }
+    }
+    return null;
+  }
+
+  function shorten(address = '') {
+    if (!address) return '';
+    return `${address.slice(0, 6)}...${address.slice(-4)}`;
+  }
+
   async function mintMembership() {
     setMinting(true);
+    let contract;
+    let address;
     try {
       const provider = new ethers.BrowserProvider(window.ethereum);
       const signer = await provider.getSigner();
-      const contract = new ethers.Contract(CONTRACT_ADDRESS, abi, signer);
+      contract = new ethers.Contract(CONTRACT_ADDRESS, abi, signer);
+      address = await signer.getAddress();
       const token = TOKENS[currency];
 
       const erc20 = new ethers.Contract(token.address, ERC20_ABI, signer);
@@ -84,18 +129,30 @@ function App() {
       const receipt = await mintTx.wait();
 
       console.log("📦 Parsing event logs...");
-      const event = receipt.logs.find(log =>
-        log.topics[0] === ethers.id('MembershipMinted(address,uint256,uint256)')
-      );
-      const tokenId = event ? parseInt(event.topics[2], 16) : null;
+      const parsed = receipt.logs
+        .map(log => {
+          try {
+            return contract.interface.parseLog(log);
+          } catch (_) {
+            return null;
+          }
+        })
+        .find(log => log && log.name === 'MembershipMinted');
+      const tokenId = parsed?.args?.tokenId ?? parsed?.args?.[1];
 
-      if (tokenId) {
-        const tokenUri = await contract.tokenURI(tokenId);
-        const metadata = await fetch(tokenUri).then(res => res.json());
-        setNftData({ id: tokenId, ...metadata });
-      } else {
-        throw new Error('Event parsing failed');
+      if (!tokenId) {
+        const existingPass = await loadMemberPass(contract, address);
+        if (!existingPass) {
+          throw new Error('Event parsing failed');
+        }
+        setNftData(existingPass);
+        return;
       }
+
+      const tokenUri = await contract.tokenURI(tokenId);
+      const metadata = await fetch(tokenUri).then(res => res.json());
+      const mintedId = tokenId.toString();
+      setNftData({ id: mintedId, ...metadata });
 
     } catch (err) {
       console.error('❌ Minting failed:', err);
@@ -104,30 +161,16 @@ function App() {
       if (alreadyMinted) {
         alert('🎟 You already minted this Pass! Loading your dashboard...');
         try {
-          const provider = new ethers.BrowserProvider(window.ethereum);
-          const signer = await provider.getSigner();
-          const contract = new ethers.Contract(CONTRACT_ADDRESS, abi, signer);
-          const address = await signer.getAddress();
-          const balance = await contract.balanceOf(address);
-
-          if (balance > 0) {
-            let foundTokenId = null;
-            for (let i = 1; i <= 100; i++) {
-              try {
-                const owner = await contract.ownerOf(i);
-                if (owner.toLowerCase() === address.toLowerCase()) {
-                  foundTokenId = i;
-                  break;
-                }
-              } catch (_) {}
-            }
-
-            if (foundTokenId) {
-              const tokenUri = await contract.tokenURI(foundTokenId);
-              const metadata = await fetch(tokenUri).then(res => res.json());
-              setNftData({ id: foundTokenId, ...metadata });
-              return;
-            }
+          if (!contract || !address) {
+            const provider = new ethers.BrowserProvider(window.ethereum);
+            const signer = await provider.getSigner();
+            contract = new ethers.Contract(CONTRACT_ADDRESS, abi, signer);
+            address = await signer.getAddress();
+          }
+          const existingPass = await loadMemberPass(contract, address);
+          if (existingPass) {
+            setNftData(existingPass);
+            return;
           }
         } catch (dashboardError) {
           console.error("❌ Error loading dashboard:", dashboardError);
@@ -167,6 +210,15 @@ function App() {
                   ))}
                 </select>
               </div>
+
+              {(destinations.axmcSafe || destinations.treasury) && (
+                <div style={{ marginTop: '1rem', padding: '1rem', background: '#181818', borderRadius: '0.75rem', border: '1px solid #222' }}>
+                  <p style={{ margin: 0 }}>Funds route on-chain to:</p>
+                  {destinations.axmcSafe && <p style={{ margin: '0.35rem 0 0 0' }}>AXMC Safe: {shorten(destinations.axmcSafe)}</p>}
+                  {destinations.treasury && <p style={{ margin: '0.35rem 0 0 0' }}>Treasury: {shorten(destinations.treasury)}</p>}
+                  <p style={{ margin: '0.35rem 0 0 0', color: '#aaa', fontSize: '0.9rem' }}>Membership contract: {shorten(CONTRACT_ADDRESS)}</p>
+                </div>
+              )}
 
               <div style={{ marginTop: '1rem' }}>
                 <label>
